@@ -1,0 +1,470 @@
+---
+# cspell: ignore amet automount WSLENV
+name: test
+
+on:
+  merge_group:
+    branches:
+      - "main"
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "main"
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_call:
+concurrency:
+  # Avoids canceling push to main of the same commit (github.sha) but will
+  # cancel running builds when you update the source branch of a PR.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  checks: read
+  contents: read
+  id-token: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  prek:
+    runs-on: ubuntu-24.04
+    environment:
+      name: ack # ANSIBUDDY_BOT_PAT, ANSIBUDDY_GPG_PRIVATE_KEY, ANSIBUDDY_GPG_PASSPHRASE
+    permissions:
+      # git commit/push use ansibuddy PAT from checkout; GITHUB_TOKEN only comments
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # we need tags for dynamic versioning
+          show-progress: false
+          ref: ${{ github.event.pull_request.head.sha || github.head_ref || github.ref_name }}
+          # Fork PRs cannot read ack secrets; default token is enough to run prek.
+          token: ${{ secrets.ANSIBUDDY_BOT_PAT || secrets.BOT_PAT || github.token }}
+
+      # needed by our prek system hooks like toml
+      - name: Install uv (cache)
+        uses: astral-sh/setup-uv@v10.1.0
+
+      # needed by our prek systems hooks like biome
+      - name: Install node (cache)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+
+      - name: Run install for node dependencies (yarn/npm/pnpm)
+        if: hashFiles('yarn.lock') != '' || hashFiles('package-lock.json') != '' || hashFiles('pnpm-lock.yaml') != ''
+        run: |
+          [ ! -f yarn.lock ] || npx yarn install --immutable
+          [ ! -f package-lock.json ] || npm ci
+          [ ! -f pnpm-lock.yaml ] || pnpm install --frozen-lockfile
+
+      - uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
+        id: prek
+        with:
+          extra-args: --all-files
+        continue-on-error: true
+
+      - name: Import GPG Key
+        if: >-
+          steps.prek.outcome == 'failure' &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7
+        with:
+          gpg_private_key: ${{ secrets.ANSIBUDDY_GPG_PRIVATE_KEY || secrets.BOT_GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.ANSIBUDDY_GPG_PASSPHRASE || secrets.BOT_GPG_PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_committer_name: "ansibuddy"
+          git_committer_email: "107943535+ansibuddy@users.noreply.github.com"
+
+      - name: Commit & push changes
+        id: commit-and-push
+        if: >-
+          steps.prek.outcome == 'failure' &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          git add .
+          git status
+          git commit -S -m "chore[bot]: auto-fix lint errors"
+          git push
+
+      - name: react if linting errors were not fixed
+        if: steps.commit-and-push.outcome == 'failure'
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            @${{ github.actor }} I tried to fix the linting errors, but it didn't work. Please fix them manually.
+            See [CI log](https://github.com/${{ github.repository_owner }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for more details.
+
+      - name: Fail if lint errors remain
+        if: >-
+          always() &&
+          steps.prek.outcome == 'failure' &&
+          steps.commit-and-push.outcome != 'success'
+        run: exit 1
+
+  tox:
+    uses: ansible/team-devtools/.github/workflows/tox.yml@main
+    needs: prek
+    secrets: inherit
+    with:
+      min_python: "3.12"
+      default_python: "3.12"
+      max_python: "3.14"
+      other_names: |
+        lint
+        hooks
+        image
+      platforms: linux,macos
+
+  oasdiff:
+    needs: prek
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          show-progress: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+
+      - name: Install oasdiff
+        env:
+          OASDIFF_VERSION: "1.18.5"
+          OASDIFF_SHA256: "9352233c1234bf5baf4d983078f7afff7bab4941abc253a14914f13ea31a3bf4"
+        run: |
+          curl -sSfL "https://github.com/Tufin/oasdiff/releases/download/v${OASDIFF_VERSION}/oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" -o /tmp/oasdiff.tar.gz
+          ACTUAL_SHA256=$(sha256sum /tmp/oasdiff.tar.gz | awk '{print $1}')
+          if [ "${ACTUAL_SHA256}" != "${OASDIFF_SHA256}" ]; then
+            echo "::error::oasdiff checksum mismatch! Expected ${OASDIFF_SHA256}, got ${ACTUAL_SHA256}"
+            exit 1
+          fi
+          tar -xzf /tmp/oasdiff.tar.gz -C /usr/local/bin oasdiff
+          chmod +x /usr/local/bin/oasdiff
+          oasdiff --help > /dev/null
+          rm /tmp/oasdiff.tar.gz
+
+      - name: Run oasdiff tests
+        run: uv run pytest tests/oasdiff/ -v
+
+  matrix:
+    needs: prek
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Self test 'matrix' action
+        uses: ./matrix
+
+  upload-artifact:
+    name: upload-artifact-${{ matrix.name || matrix.runs-on }}
+    needs: prek
+    env:
+      # ACTIONS_RUNNER_DEBUG: "true"
+      # ACTIONS_STEP_DEBUG: "true"
+      # https://docs.github.com/en/actions/learn-github-actions/environment-variables
+      # https://devblogs.microsoft.com/commandline/share-environment-vars-between-wsl-and-windows/
+      WSLENV: "HOSTNAME:CI:FORCE_COLOR:GITHUB_ACTION:GITHUB_ACTION_PATH/p: GITHUB_ACTION_REPOSITORY:GITHUB_WORKFLOW:GITHUB_WORKSPACE/p: GITHUB_PATH/p:GITHUB_ENV/p:VIRTUAL_ENV/p:SKIP_PODMAN:SKIP_DOCKER:NODE_OPTIONS"
+      # We define a hostname because otherwise the variable might not always be accessible on runners.
+      HOSTNAME: gha
+    defaults:
+      run:
+        shell: ${{ contains(matrix.name, 'wsl') && 'wsl-bash {0}' || 'bash' }}
+    strategy:
+      matrix:
+        # runs-on: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+        include:
+          - runs-on: windows-2025
+            name: windows-2025
+          - runs-on: windows-2025
+            name: windows-2025-wsl
+          - runs-on: ubuntu-24.04
+            name: ubuntu-24.04
+          - runs-on: ubuntu-24.04-arm
+            name: ubuntu-24.04-arm
+          - runs-on: macos-15
+            name: macos-15
+      fail-fast: false
+
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      # https://github.com/marketplace/actions/setup-wsl
+      - name: Activate WSL
+        if: contains(matrix.name, 'wsl') && (matrix.runs-on || '') != 'self-hosted'
+        uses: Vampire/setup-wsl@v7.0.0
+        with:
+          distribution: Ubuntu-24.04
+          set-as-default: "true"
+          # '-i' seems to be the only option that loads .bashrc file that we need
+          # https://github.com/Vampire/setup-wsl/discussions/54
+          wsl-shell-command: "bash -i -eo pipefail"
+          # https://github.com/MicrosoftDocs/WSL/blob/main/WSL/wsl-config.md#L159
+          wsl-conf: |
+            [automount]
+            enabled = true
+            root = /
+            options = "metadata,umask=077"
+            [boot]
+            command=/etc/init.d/dbus start
+            [interop]
+            enabled = false
+            appendWindowsPath = false
+            [network]
+            hostname = wsl
+          additional-packages: curl
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install the latest version of uv
+        if: ${{ runner.os != 'Windows' }}
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: "latest"
+          ignore-nothing-to-cache: true
+
+      - uses: actions/cache@v6
+        if: ${{ runner.os != 'Windows' }}
+        with:
+          path: |
+            ~/.cache/prek/
+            ~/.cache/uv/
+            ~/.npm/
+          key: >-
+            cache-${{ runner.os }}-${{ runner.arch }}-
+            ${{ hashFiles(
+            '**/.pre-commit-config.yaml',
+            '**/package-lock.json',
+            '**/package.json',
+            '**/pnpm-lock.yaml',
+            '**/prek.toml',
+            '**/pyproject.toml',
+            '**/uv.lock',
+            '**/yarn.lock'
+            ) }}
+
+      - name: Lint
+        if: ${{ runner.os != 'Windows' }}
+        # See https://github.com/rhysd/actionlint/issues/555
+        run: >
+          ${{ runner.os == 'Linux' && runner.arch == 'ARM64' && 'SKIP=actionlint ' || '' }}
+          uv tool run prek run --all-files --show-diff-on-failure
+
+      # Test end-to-end by uploading a few artifacts and then downloading them
+      - name: Create artifact files
+        run: |
+          mkdir -p path/to/dir-1
+          mkdir -p path/to/dir-2
+          mkdir -p path/to/dir-3
+          mkdir -p symlink/
+          echo "Lorem ipsum dolor sit amet" > path/to/dir-1/file1.txt
+          echo "Hello world from file #2" > path/to/dir-2/file2.txt
+      # shell: bash
+      - name: Create artifact files (symlinks)
+        if: ${{ !contains(matrix.name, 'wsl') }}
+        run: |
+          echo "Hello from a symlinked file" > symlink/original.txt
+          ln -s "$(pwd)/symlink/original.txt" symlink/abs.txt
+          ln -s original.txt symlink/rel.txt
+
+      # Upload a single file artifact
+      - name: "Upload artifact #1"
+        uses: ./upload-artifact
+        with:
+          name: "Artifact-A-${{ matrix.name }}"
+          path: path/to/dir-1/file1.txt
+
+      # Upload using a wildcard pattern
+      - name: "Upload artifact #2"
+        uses: ./upload-artifact
+        with:
+          name: "Artifact-Wildcard-${{ matrix.name }}"
+          path: path/**/dir*/
+
+      # Upload a multi-path artifact
+      - name: "Upload artifact #3"
+        uses: ./upload-artifact
+        with:
+          name: "Multi-Path-Artifact-${{ matrix.name }}"
+          path: |
+            path/to/dir-1/*
+            path/to/dir-[23]/*
+            !path/to/dir-3/*.txt
+
+      - name: "Upload symlinked artifact"
+        if: ${{ !contains(matrix.name, 'wsl') }}
+        uses: ./upload-artifact
+        with:
+          name: "Symlinked-Artifact-${{ matrix.name }}"
+          path: |
+            symlink/abs.txt
+            symlink/rel.txt
+
+      # Download Artifact #1 and verify the correctness of the content
+      - name: "Download artifact #1"
+        uses: actions/download-artifact@v8
+        with:
+          name: "Artifact-A-${{ matrix.name }}"
+          path: some/new/path
+
+      - name: "Verify Artifact #1"
+        run: |
+          $file = "some/new/path/file1.txt"
+          if(!(Test-Path -path $file))
+          {
+              Write-Error "Expected file does not exist"
+          }
+          if(!((Get-Content $file) -ceq "Lorem ipsum dolor sit amet"))
+          {
+              Write-Error "File contents of downloaded artifact are incorrect"
+          }
+        shell: pwsh
+
+      # Download Artifact #2 and verify the correctness of the content
+      - name: "Download artifact #2"
+        uses: actions/download-artifact@v8
+        with:
+          name: "Artifact-Wildcard-${{ matrix.name }}"
+          path: some/other/path
+
+      - name: "Verify Artifact #2"
+        run: |
+          $file1 = "some/other/path/to/dir-1/file1.txt"
+          $file2 = "some/other/path/to/dir-2/file2.txt"
+          if(!(Test-Path -path $file1) -or !(Test-Path -path $file2))
+          {
+              Write-Error "Expected files do not exist"
+          }
+          if(!((Get-Content $file1) -ceq "Lorem ipsum dolor sit amet") -or !((Get-Content $file2) -ceq "Hello world from file #2"))
+          {
+              Write-Error "File contents of downloaded artifacts are incorrect"
+          }
+        shell: pwsh
+
+      # Download Artifact #3 and verify the correctness of the content
+      - name: "Download artifact #3"
+        uses: actions/download-artifact@v8
+        with:
+          name: "Artifact-Wildcard-${{ matrix.name }}"
+          path: verify-artifact-3
+
+      - name: "Verify Artifact #3"
+        run: |
+          $file1 = "verify-artifact-3/to/dir-1/file1.txt"
+          $file2 = "verify-artifact-3/to/dir-2/file2.txt"
+          if(!(Test-Path -path $file1) -or !(Test-Path -path $file2))
+          {
+              Write-Error "Expected files do not exist"
+          }
+          if(!((Get-Content $file1) -ceq "Lorem ipsum dolor sit amet") -or !((Get-Content $file2) -ceq "Hello world from file #2"))
+          {
+              Write-Error "File contents of downloaded artifacts are incorrect"
+          }
+        shell: pwsh
+
+      # Download Artifact #4 and verify the correctness of the content
+      - name: "Download artifact #4"
+        uses: actions/download-artifact@v8
+        with:
+          name: "Multi-Path-Artifact-${{ matrix.name }}"
+          path: multi/artifact
+
+      - name: "Verify Artifact #4"
+        run: |
+          $file1 = "multi/artifact/dir-1/file1.txt"
+          $file2 = "multi/artifact/dir-2/file2.txt"
+          if(!(Test-Path -path $file1) -or !(Test-Path -path $file2))
+          {
+              Write-Error "Expected files do not exist"
+          }
+          if(!((Get-Content $file1) -ceq "Lorem ipsum dolor sit amet") -or !((Get-Content $file2) -ceq "Hello world from file #2"))
+          {
+              Write-Error "File contents of downloaded artifacts are incorrect"
+          }
+        shell: pwsh
+
+      - name: "Download symlinked artifact"
+        if: ${{ !contains(matrix.name, 'wsl') }}
+        uses: actions/download-artifact@v8
+        with:
+          name: "Symlinked-Artifact-${{ matrix.name }}"
+          path: from/symlink
+
+      - name: "Verify symlinked artifact"
+        if: ${{ !contains(matrix.name, 'wsl') }}
+        run: |
+          $abs = "from/symlink/abs.txt"
+          if(!(Test-Path -path $abs))
+          {
+              Write-Error "Expected file does not exist"
+          }
+          if(!((Get-Content $abs) -ceq "Hello from a symlinked file"))
+          {
+              Write-Error "File contents of downloaded artifact are incorrect"
+          }
+          $rel = "from/symlink/rel.txt"
+          if(!(Test-Path -path $rel))
+          {
+              Write-Error "Expected file does not exist"
+          }
+          if(!((Get-Content $rel) -ceq "Hello from a symlinked file"))
+          {
+              Write-Error "File contents of downloaded artifact are incorrect"
+          }
+        shell: pwsh
+
+      - name: "Alter file 1 content"
+        run: |
+          echo "This file has changed" > path/to/dir-1/file1.txt
+
+      # Replace the contents of Artifact #1
+      - name: "Overwrite artifact #1"
+        uses: ./upload-artifact
+        with:
+          name: "Artifact-A-${{ matrix.name }}"
+          path: path/to/dir-1/file1.txt
+          overwrite: true
+
+      # Download replaced Artifact #1 and verify the correctness of the content
+      - name: "Download artifact #1 again"
+        uses: actions/download-artifact@v8
+        with:
+          name: "Artifact-A-${{ matrix.name }}"
+          path: overwrite/some/new/path
+
+      - name: "Verify Artifact #1 again"
+        run: |
+          $file = "overwrite/some/new/path/file1.txt"
+          if(!(Test-Path -path $file))
+          {
+              Write-Error "Expected file does not exist"
+          }
+          if(!((Get-Content $file) -ceq "This file has changed"))
+          {
+              Write-Error "File contents of downloaded artifact are incorrect"
+          }
+        shell: pwsh
+  check:
+    needs:
+      - tox
+      - matrix
+      - upload-artifact
+      - oasdiff
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Remove test artifacts
+        if: always()
+        uses: geekyeggo/delete-artifact@v6
+        with:
+          name: |
+            Artifact-*
+            Symlinked-Artifact-*
+            Multi-Path-Artifact-*
+          failOnError: false

@@ -1,0 +1,89 @@
+---
+# secured workflow to analyze results from insecure 'ci' workflow that
+# builds and test the project.
+name: post
+on:
+  workflow_run:
+    workflows:
+      - test
+    types:
+      - completed
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  pull-requests: read
+  statuses: write
+jobs:
+  sonar:
+    runs-on: ubuntu-latest
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.event != 'pull_request' ||
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    steps:
+      - name: Debug
+        run: |
+          cat <<EOF
+          ${{ github.event.workflow_run }}
+          EOF
+
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download artifacts (coverage reports)
+        id: download-coverage
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: logs.zip
+          path: .git/coverage
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if no coverage reports are found
+        run: |
+          if ! find . -name 'coverage.xml' -print -quit | grep -q .; then
+            echo "::error::No coverage.xml found. Sonar expects coverage (sonar.python.coverage.reportPaths=**/coverage.xml)."
+            exit 1
+          fi
+
+      - name: Get PR context
+        # Source: https://github.com/orgs/community/discussions/25220#discussioncomment-11316244
+        id: pr-context
+        if: github.event.workflow_run.event == 'pull_request'
+        env:
+          # Token required for GH CLI:
+          GH_TOKEN: ${{ github.token }}
+          # Best practice for scripts is to reference via ENV at runtime. Avoid using the expression syntax in the script content directly:
+          PR_TARGET_REPO: ${{ github.repository }}
+          # If the PR is from a fork, prefix it with `<owner-login>:`, otherwise only the PR branch name is relevant:
+          PR_BRANCH: |-
+            ${{
+              (github.event.workflow_run.head_repository.owner.login != github.event.workflow_run.repository.owner.login)
+                && format('{0}:{1}', github.event.workflow_run.head_repository.owner.login, github.event.workflow_run.head_branch)
+                || github.event.workflow_run.head_branch
+            }}
+        # Query the PR number by repo + branch, then assign to step output:
+        run: |
+          gh pr view --repo "${PR_TARGET_REPO}" "${PR_BRANCH}" \
+              --json 'number,baseRefName' --jq '"number=\(.number)\nbase_ref=\(.baseRefName)"' \
+              >> "${GITHUB_OUTPUT}"
+
+      - name: SonarCloud scan
+        # Coverage processing if js map files are not present so we cannot do
+        # this from inside 'check' job.
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets[format('{0}', vars.SONAR_TOKEN_SECRET_NAME)] }}
+        with:
+          args: >
+            ${{ env.SONAR_ARGS }}
+            -Dsonar.scm.revision=${{ github.event.workflow_run.head_sha }}
+            -Dsonar.pullrequest.key=${{ steps.pr-context.outputs.number }}
+            -Dsonar.pullrequest.branch=${{ steps.pr-context.outputs.pr_branch }}
+            -Dsonar.pullrequest.base=${{ steps.pr-context.outputs.base_ref }}
+            -Dsonar.verbose=${{ secrets.ACTIONS_STEP_DEBUG }}

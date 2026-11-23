@@ -1,0 +1,19 @@
+---
+# https://github.com/marketplace/actions/actions-tagger
+name: release
+
+"on":
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+jobs:
+  actions-tagger:
+    runs-on: windows-latest
+    permissions:
+      # Give the default GITHUB_TOKEN write permission.
+      # https://github.blog/changelog/2023-02-02-github-actions-updating-the-default-github_token-permissions-to-read-only/
+      contents: write
+    steps:
+      - uses: Actions-R-Us/actions-tagger@v2
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
